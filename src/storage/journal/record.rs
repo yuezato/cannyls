@@ -12,8 +12,8 @@ pub const TAG_SIZE: usize = 1;
 pub const CHECKSUM_SIZE: usize = 4;
 pub const LENGTH_SIZE: usize = 2;
 pub const PORTION_SIZE: usize = 5;
-pub const END_OF_RECORDS_SIZE: usize = CHECKSUM_SIZE + TAG_SIZE;
-pub const EMBEDDED_DATA_OFFSET: usize = CHECKSUM_SIZE + TAG_SIZE + LumpId::SIZE + LENGTH_SIZE;
+pub const END_OF_RECORDS_SIZE: usize = 2 * CHECKSUM_SIZE + TAG_SIZE;
+pub const EMBEDDED_DATA_OFFSET: usize = 2 * CHECKSUM_SIZE + TAG_SIZE + LumpId::SIZE + LENGTH_SIZE;
 
 const TAG_END_OF_RECORDS: u8 = 0;
 const TAG_GO_TO_FRONT: u8 = 1;
@@ -50,6 +50,38 @@ pub enum JournalRecord<T> {
     DeleteRange(Range<LumpId>),
 }
 impl<T: AsRef<[u8]>> JournalRecord<T> {
+    /// このレコードがEndOfRecordsを表しているかどうかを調べる。
+    pub fn is_eor(&self) -> bool {
+        match *self {
+            JournalRecord::EndOfRecords => true,
+            _ => false,
+        }
+    }
+
+    /// デバッグ用のヘルパ関数
+    pub fn dump(&self) {
+        match *self {
+            JournalRecord::EndOfRecords => {
+                println!("EndOfRecords");
+            }
+            JournalRecord::GoToFront => {
+                println!("GoToFront");
+            }
+            JournalRecord::Put(lumpid, _) => {
+                println!("Put {:?}", lumpid);
+            }
+            JournalRecord::Embed(lumpid, _) => {
+                println!("Embed {:?}", lumpid);
+            }
+            JournalRecord::Delete(lumpid) => {
+                println!("Delete {:?}", lumpid);
+            }
+            JournalRecord::DeleteRange(_) => {
+                println!("DeleteRange");
+            }
+        }
+    }
+
     /// 読み書き時のサイズ（バイト数）を返す.
     pub(crate) fn external_size(&self) -> usize {
         let record_size = match *self {
@@ -59,12 +91,23 @@ impl<T: AsRef<[u8]>> JournalRecord<T> {
             JournalRecord::Delete(..) => LumpId::SIZE,
             JournalRecord::DeleteRange(..) => LumpId::SIZE * 2,
         };
-        CHECKSUM_SIZE + TAG_SIZE + record_size
+        2 * CHECKSUM_SIZE + TAG_SIZE + record_size
     }
 
     /// `writer`にレコードを書き込む.
-    pub(crate) fn write_to<W: Write>(&self, mut writer: W) -> Result<()> {
-        track_io!(writer.write_u32::<BigEndian>(self.checksum()))?;
+    pub(crate) fn write_to<W: Write>(&self, mut writer: W, prev_checksum: u32) -> Result<u32> {
+        let checksum = self.checksum();
+        track_io!(writer.write_u32::<BigEndian>(checksum))?;
+        track_io!(writer.write_u32::<BigEndian>(prev_checksum))?;
+
+        println!("<WRITE_TO>");
+        self.dump();
+        println!(
+            "checksum = {:x}, prev_checksum = {:x}",
+            checksum, prev_checksum
+        );
+        println!("</WRITE_TO>");
+
         match *self {
             JournalRecord::EndOfRecords => {
                 track_io!(writer.write_u8(TAG_END_OF_RECORDS))?;
@@ -95,10 +138,10 @@ impl<T: AsRef<[u8]>> JournalRecord<T> {
                 track_io!(writer.write_u128::<BigEndian>(range.end.as_u128()))?;
             }
         }
-        Ok(())
+        Ok(checksum)
     }
 
-    fn checksum(&self) -> u32 {
+    pub(crate) fn checksum(&self) -> u32 {
         let mut adler32 = RollingAdler32::new();
         match *self {
             JournalRecord::EndOfRecords => {
@@ -137,10 +180,15 @@ impl<T: AsRef<[u8]>> JournalRecord<T> {
         adler32.hash()
     }
 }
+
+#[derive(Debug, PartialEq)]
+pub struct JournalRecordWithChecksum(pub JournalRecord<Vec<u8>>, pub u32);
+
 impl JournalRecord<Vec<u8>> {
     /// `reader`からレコードを読み込む.
-    pub(crate) fn read_from<R: Read>(mut reader: R) -> Result<Self> {
+    pub(crate) fn read_from<R: Read>(mut reader: R) -> Result<JournalRecordWithChecksum> {
         let checksum = track_io!(reader.read_u32::<BigEndian>())?;
+        let prev_checksum = track_io!(reader.read_u32::<BigEndian>())?;
         let tag = track_io!(reader.read_u8())?;
         let record = match tag {
             TAG_END_OF_RECORDS => JournalRecord::EndOfRecords,
@@ -177,8 +225,13 @@ impl JournalRecord<Vec<u8>> {
                 tag
             ),
         };
+        println!(
+            "record.checksum = {:x}, checksum = {:x}",
+            record.checksum(),
+            checksum
+        );
         track_assert_eq!(record.checksum(), checksum, ErrorKind::StorageCorrupted);
-        Ok(record)
+        Ok(JournalRecordWithChecksum(record, prev_checksum))
     }
 }
 
@@ -231,9 +284,9 @@ mod tests {
         ];
         for e0 in records {
             let mut buf = Vec::new();
-            track!(e0.write_to(&mut buf))?;
+            track!(e0.write_to(&mut buf, 0xdeadbeaf))?;
             let e1 = track!(JournalRecord::read_from(&buf[..]))?;
-            assert_eq!(e1, e0);
+            assert_eq!(e1, JournalRecordWithChecksum(e0, 0xdeadbeaf));
         }
         Ok(())
     }
@@ -248,8 +301,8 @@ mod tests {
             },
         );
         let mut buf = Vec::new();
-        track!(e.write_to(&mut buf))?;
-        buf[6] += 1; // Tampers a byte
+        track!(e.write_to(&mut buf, 0xdeadbeaf))?;
+        buf[10] += 1; // Tampers a byte
 
         let result = JournalRecord::read_from(&buf[..]);
         assert!(result.is_err());

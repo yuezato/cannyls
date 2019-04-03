@@ -248,9 +248,9 @@ where
         // ジャーナル領域に範囲削除レコードを一つ書き込むため、一度のディスクアクセスが起こる。
         // 削除レコードを範囲分書き込むわけ *ではない* ため、複数回のディスクアクセスは発生しない。
         track!(self
-               .journal_region
-               .records_delete_range(&mut self.lump_index, range))?;
-        
+            .journal_region
+            .records_delete_range(&mut self.lump_index, range))?;
+
         for lump_id in &targets {
             if let Some(portion) = self.lump_index.remove(lump_id) {
                 self.metrics.delete_lumps.increment();
@@ -262,7 +262,7 @@ where
                     self.data_region.delete(portion);
                 }
             }
-        }        
+        }
 
         Ok(targets)
     }
@@ -422,7 +422,6 @@ mod tests {
         assert!(!storage.delete(&id("000"))?);
         assert!(storage.get(&id("000"))?.is_none());
         assert!(storage.head(&id("000")).is_none());
-
         assert!(storage.put(&id("000"), &data("hello"))?);
         assert!(storage.put(&id("111"), &data("world"))?);
         for _ in 0..10 {
@@ -436,6 +435,46 @@ mod tests {
         let nvm = track!(FileNvm::open(dir.path().join("test.lusf")))?;
         let storage = track!(Storage::open(nvm))?;
         assert_eq!(storage.list(), vec![id("000"), id("111")]);
+        Ok(())
+    }
+
+    #[test]
+    fn go_around() -> TestResult {
+        let dir = track_io!(TempDir::new("cannyls_test"))?;
+
+        let nvm = track!(FileNvm::create(
+            dir.path().join("test.lusf"),
+            BlockSize::min().ceil_align(1100 * 100)
+        ))?;
+        let mut storage = track!(Storage::create(nvm))?;
+
+        let vec: Vec<u8> = vec![42; 100];
+        let lump_data = track!(LumpData::new_embedded(vec))?;
+        for i in 0..6 {
+            let id = id(&format!("{}", i));
+            track!(storage.put(&id, &lump_data))?;
+            if i % 2 == 0 {
+                track!(storage.delete(&id))?;
+            }
+            track!(storage.run_side_job_once())?;
+        }
+
+        track!(storage.journal_sync())?;
+        {
+            let snapshot = track!(storage.journal_snapshot())?;
+            dbg!(snapshot.unreleased_head);
+            dbg!(snapshot.head);
+            dbg!(snapshot.tail);
+            // assert_eq!(snapshot.unreleased_head, 0);
+            // assert_eq!(snapshot.head, 0);
+            // assert_eq!(snapshot.tail, 2100);
+        }
+        mem::drop(storage);
+
+        // open
+        let nvm = track!(FileNvm::open(dir.path().join("test.lusf")))?;
+        // let storage = track!(Storage::open(nvm))?;
+
         Ok(())
     }
 

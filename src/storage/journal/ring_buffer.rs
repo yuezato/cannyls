@@ -2,7 +2,7 @@ use prometrics::metrics::MetricBuilder;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use super::record::{EMBEDDED_DATA_OFFSET, END_OF_RECORDS_SIZE};
-use super::{JournalEntry, JournalNvmBuffer, JournalRecord};
+use super::{JournalEntry, JournalNvmBuffer, JournalRecord, JournalRecordWithChecksum};
 use lump::LumpId;
 use metrics::JournalQueueMetrics;
 use nvm::NonVolatileMemory;
@@ -34,6 +34,8 @@ pub struct JournalRingBuffer<N: NonVolatileMemory> {
     tail: u64,
 
     metrics: JournalQueueMetrics,
+
+    latest_checksum: Option<u32>,
 }
 impl<N: NonVolatileMemory> JournalRingBuffer<N> {
     pub fn head(&self) -> u64 {
@@ -45,9 +47,10 @@ impl<N: NonVolatileMemory> JournalRingBuffer<N> {
 
     pub fn journal_entries(&mut self) -> Result<(u64, u64, u64, Vec<JournalEntry>)> {
         track_io!(self.nvm.seek(SeekFrom::Start(self.head)))?;
-        let result: Result<Vec<JournalEntry>> =
-            ReadEntries::new(&mut self.nvm, self.head).collect();
-        result.map(|r| (self.unreleased_head, self.head, self.tail, r))
+        let result: Result<Vec<JournalEntry>> = ReadEntries::new(&mut self.nvm, self.head)
+            .map(|e| e.map(|e| e.0))
+            .collect();
+        track!(result.map(|r| (self.unreleased_head, self.head, self.tail, r)))
     }
 
     /// `JournalRingBuffer`インスタンスを生成する.
@@ -60,6 +63,7 @@ impl<N: NonVolatileMemory> JournalRingBuffer<N> {
             head,
             tail: head,
             metrics,
+            latest_checksum: None, // 初期値どうするか問題がある
         }
     }
 
@@ -108,6 +112,26 @@ impl<N: NonVolatileMemory> JournalRingBuffer<N> {
         track!(self.nvm.sync())
     }
 
+    pub fn tail_checksum(&self) -> u32 {
+        self.latest_checksum.unwrap_or(0x1234_5678) // !!
+                                                    // Noneはheadの次に位置するエントリに書き込まれる値である
+    }
+
+    pub fn update_tail_checksum(&mut self, new_checksum: u32) {
+        self.latest_checksum = Some(new_checksum);
+    }
+
+    pub fn write_record<B: AsRef<[u8]>>(&mut self, record: &JournalRecord<B>) -> Result<()> {
+        // record.dump();
+        let prev_checksum = self.tail_checksum();
+        let new_checksum = track!(record.write_to(&mut self.nvm, prev_checksum))?;
+        // println!("prev_checksum = {:x}, new_checksum = {:x}", prev_checksum, new_checksum);
+        if !record.is_eor() {
+            self.update_tail_checksum(new_checksum);
+        }
+        Ok(())
+    }
+
     /// レコードをジャーナルの末尾に追記する.
     ///
     /// レコードが`JournalRecord::Embed`だった場合には、データを埋め込んだ位置を結果として返す.
@@ -121,7 +145,7 @@ impl<N: NonVolatileMemory> JournalRingBuffer<N> {
         // 2. リングバッファの終端チェック
         if self.will_overflow(record) {
             track_io!(self.nvm.seek(SeekFrom::Start(self.tail)))?;
-            track!(JournalRecord::GoToFront::<[_; 0]>.write_to(&mut self.nvm))?;
+            track!(self.write_record(&JournalRecord::GoToFront::<[_; 0]>))?;
 
             // 先頭に戻って再試行
             self.metrics
@@ -135,7 +159,7 @@ impl<N: NonVolatileMemory> JournalRingBuffer<N> {
         // 3. レコードを書き込む
         let prev_tail = self.tail;
         track_io!(self.nvm.seek(SeekFrom::Start(self.tail)))?;
-        track!(record.write_to(&mut self.nvm))?;
+        track!(self.write_record(record))?;
         self.metrics.enqueued_records_at_running.increment(record);
 
         // 4. 終端を示すレコードも書き込む
@@ -143,7 +167,7 @@ impl<N: NonVolatileMemory> JournalRingBuffer<N> {
         self.metrics
             .consumed_bytes_at_running
             .add_u64(self.tail - prev_tail);
-        track!(JournalRecord::EndOfRecords::<[_; 0]>.write_to(&mut self.nvm))?;
+        track!(self.write_record(&JournalRecord::EndOfRecords::<[_; 0]>))?;
 
         // 5. 埋め込みPUTの場合には、インデックスに位置情報を返す
         if let JournalRecord::Embed(ref lump_id, ref data) = *record {
@@ -246,11 +270,11 @@ impl<'a, N: 'a + NonVolatileMemory> RestoredEntries<'a, N> {
     }
 }
 impl<'a, N: 'a + NonVolatileMemory> Iterator for RestoredEntries<'a, N> {
-    type Item = Result<JournalEntry>;
+    type Item = Result<(JournalEntry, u32)>;
     fn next(&mut self) -> Option<Self::Item> {
         let next = self.entries.next();
         match next {
-            Some(Ok(ref entry)) => {
+            Some(Ok((ref entry, _))) => {
                 self.metrics
                     .enqueued_records_at_starting
                     .increment(&entry.record);
@@ -291,11 +315,19 @@ impl<'a, N: 'a + NonVolatileMemory> Iterator for DequeuedEntries<'a, N> {
     type Item = Result<JournalEntry>;
     fn next(&mut self) -> Option<Self::Item> {
         let next = self.entries.next();
-        if let Some(Ok(ref entry)) = next {
+        /*
+         * GC時にはGoToFront（とEndOfRecords）はこのイテレータで返ってきて欲しくないので除外する
+         */
+        if let Some(Ok((ref entry, _))) = next {
+            if entry.record == JournalRecord::GoToFront {
+                return self.next();
+            }
+        }
+        if let Some(Ok((ref entry, _))) = next {
             self.metrics.dequeued_records.increment(&entry.record);
             *self.head = entry.end().as_u64();
         }
-        next
+        next.map(|v| v.map(|v| v.0))
     }
 }
 
@@ -304,6 +336,7 @@ struct ReadEntries<'a, N: 'a + NonVolatileMemory> {
     reader: BufReader<&'a mut JournalNvmBuffer<N>>,
     current: u64,
     is_second_lap: bool,
+    pred_is_go_to_front: bool,
 }
 impl<'a, N: 'a + NonVolatileMemory> ReadEntries<'a, N> {
     fn new(nvm: &'a mut JournalNvmBuffer<N>, head: u64) -> Self {
@@ -311,6 +344,7 @@ impl<'a, N: 'a + NonVolatileMemory> ReadEntries<'a, N> {
             reader: BufReader::new(nvm),
             current: head,
             is_second_lap: false,
+            pred_is_go_to_front: false,
         }
     }
     fn with_capacity(nvm: &'a mut JournalNvmBuffer<N>, head: u64, capacity: usize) -> Self {
@@ -318,33 +352,43 @@ impl<'a, N: 'a + NonVolatileMemory> ReadEntries<'a, N> {
             reader: BufReader::with_capacity(capacity, nvm),
             current: head,
             is_second_lap: false,
+            pred_is_go_to_front: false,
         }
     }
-    fn read_record(&mut self) -> Result<Option<JournalRecord<Vec<u8>>>> {
-        match track!(JournalRecord::read_from(&mut self.reader))? {
+    fn read_record(&mut self) -> Result<Option<JournalRecordWithChecksum>> {
+        let result = track!(JournalRecord::read_from(&mut self.reader))?;
+        if self.pred_is_go_to_front {
+            self.pred_is_go_to_front = false;
+            track_assert!(!self.is_second_lap, ErrorKind::StorageCorrupted);
+            track_io!(self.reader.seek(SeekFrom::Start(0)))?;
+            self.current = 0;
+            self.is_second_lap = true;
+            return self.read_record();
+        }
+        match result.0 {
             JournalRecord::EndOfRecords => Ok(None),
             JournalRecord::GoToFront => {
-                track_assert!(!self.is_second_lap, ErrorKind::StorageCorrupted);
-                track_io!(self.reader.seek(SeekFrom::Start(0)))?;
-                self.current = 0;
-                self.is_second_lap = true;
-                self.read_record()
+                self.pred_is_go_to_front = true;
+                Ok(Some(result))
             }
-            record => Ok(Some(record)),
+            _ => Ok(Some(result)),
         }
     }
 }
 impl<'a, N: 'a + NonVolatileMemory> Iterator for ReadEntries<'a, N> {
-    type Item = Result<JournalEntry>;
+    type Item = Result<(JournalEntry, u32)>;
     fn next(&mut self) -> Option<Self::Item> {
         match self.read_record() {
             Err(e) => Some(Err(e)),
             Ok(None) => None,
             Ok(Some(record)) => {
                 let start = Address::from_u64(self.current).expect("Never fails");
-                self.current += record.external_size() as u64;
-                let entry = JournalEntry { start, record };
-                Some(Ok(entry))
+                self.current += record.0.external_size() as u64;
+                let entry = JournalEntry {
+                    start,
+                    record: record.0,
+                };
+                Some(Ok((entry, record.1)))
             }
         }
     }
@@ -423,10 +467,10 @@ mod tests {
         for _ in 0..(512 / record.external_size()) {
             track!(ring.enqueue(&record))?;
         }
-        assert_eq!(ring.tail, 1016);
+        assert_eq!(ring.tail, 1012);
 
         track!(ring.enqueue(&record))?;
-        assert_eq!(ring.tail, 21);
+        assert_eq!(ring.tail, 25);
         Ok(())
     }
 
@@ -436,16 +480,16 @@ mod tests {
         let mut ring = JournalRingBuffer::new(nvm, 0, &MetricBuilder::new());
 
         let record = record_put("000", 1, 2);
-        while ring.tail <= 1024 - record.external_size() as u64 {
+        while ring.tail < 1024 - (record.external_size() + END_OF_RECORDS_SIZE) as u64 {
             track!(ring.enqueue(&record))?;
         }
-        assert_eq!(ring.tail, 1008);
+        assert_eq!(ring.tail, 992);
 
         assert_eq!(
             ring.enqueue(&record).err().map(|e| *e.kind()),
             Some(ErrorKind::StorageFull)
         );
-        assert_eq!(ring.tail, 1008);
+        assert_eq!(ring.tail, 992);
 
         ring.unreleased_head = 511;
         ring.head = 511;
@@ -466,17 +510,17 @@ mod tests {
         let nvm = MemoryNvm::new(vec![0; 1024]);
         let mut ring = JournalRingBuffer::new(nvm, 0, &MetricBuilder::new());
 
-        let record = record_embed("000", &vec![0; 997]);
-        assert_eq!(record.external_size(), 1020);
+        let record = record_embed("000", &vec![0; 989]);
+        assert_eq!(record.external_size(), 1016);
         assert_eq!(
             ring.enqueue(&record).err().map(|e| *e.kind()),
             Some(ErrorKind::StorageFull)
         );
 
-        let record = record_embed("000", &vec![0; 996]);
-        assert_eq!(record.external_size(), 1019);
+        let record = record_embed("000", &vec![0; 988]);
+        assert_eq!(record.external_size(), 1015);
         assert!(ring.enqueue(&record).is_ok());
-        assert_eq!(ring.tail, 1019);
+        assert_eq!(ring.tail, 1015);
     }
 
     fn record_put(lump_id: &str, start: u32, len: u16) -> JournalRecord<Vec<u8>> {

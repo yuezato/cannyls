@@ -45,7 +45,7 @@ where
     N: NonVolatileMemory,
 {
     pub fn journal_entries(&mut self) -> Result<(u64, u64, u64, Vec<JournalEntry>)> {
-        self.ring_buffer.journal_entries()
+        track!(self.ring_buffer.journal_entries())
     }
 
     /// ジャーナル領域の初期化を行う.
@@ -53,7 +53,7 @@ where
     /// 具体的には`nmヘッダと最初のエントリ(EndOfEntries)を書き込む
     pub fn initialize<W: Write>(mut writer: W, block_size: BlockSize) -> Result<()> {
         track!(JournalHeader::new().write_to(&mut writer, block_size))?;
-        track!(JournalRecord::EndOfRecords::<[_; 0]>.write_to(&mut writer))?;
+        track!(JournalRecord::EndOfRecords::<[_; 0]>.write_to(&mut writer, 0xdead_beaf))?;
         Ok(())
     }
 
@@ -182,7 +182,6 @@ where
                 break;
             }
         }
-
         Ok(())
     }
 
@@ -330,8 +329,13 @@ where
 
     /// リングバッファおよびインデックスを前回の状態に復元する.
     fn restore(&mut self, index: &mut LumpIndex) -> Result<()> {
+        let mut latest_checksum: Option<u32> = None;
         for result in track!(self.ring_buffer.restore_entries())? {
-            let JournalEntry { start, record } = track!(result)?;
+            let (JournalEntry { start, record }, prev_checksum) = track!(result)?;
+            if let Some(latest_checksum) = latest_checksum {
+                assert!(latest_checksum == prev_checksum);
+            }
+            latest_checksum = Some(record.checksum());
             match record {
                 JournalRecord::Put(lump_id, portion) => {
                     index.insert(lump_id, Portion::Data(portion));
@@ -351,7 +355,11 @@ where
                         index.remove(&lump_id);
                     }
                 }
-                JournalRecord::EndOfRecords | JournalRecord::GoToFront => unreachable!(),
+                /*
+                 * GoToFrontについてもchecksumが続いているか検証する
+                 */
+                JournalRecord::GoToFront => (),
+                JournalRecord::EndOfRecords => unreachable!(),
             }
         }
         Ok(())
