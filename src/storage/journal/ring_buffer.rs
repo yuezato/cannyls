@@ -122,10 +122,8 @@ impl<N: NonVolatileMemory> JournalRingBuffer<N> {
     }
 
     pub fn write_record<B: AsRef<[u8]>>(&mut self, record: &JournalRecord<B>) -> Result<()> {
-        // record.dump();
         let prev_checksum = self.tail_checksum();
         let new_checksum = track!(record.write_to(&mut self.nvm, prev_checksum))?;
-        // println!("prev_checksum = {:x}, new_checksum = {:x}", prev_checksum, new_checksum);
         if !record.is_eor() {
             self.update_tail_checksum(new_checksum);
         }
@@ -275,10 +273,12 @@ impl<'a, N: 'a + NonVolatileMemory> Iterator for RestoredEntries<'a, N> {
         let next = self.entries.next();
         match next {
             Some(Ok((ref entry, _))) => {
-                self.metrics
-                    .enqueued_records_at_starting
-                    .increment(&entry.record);
-                *self.tail = entry.end().as_u64();
+                if entry.record != JournalRecord::GoToFront {
+                    self.metrics
+                        .enqueued_records_at_starting
+                        .increment(&entry.record);
+                    *self.tail = entry.end().as_u64();
+                }
             }
             None => {
                 let size = if self.head <= *self.tail {
@@ -336,7 +336,6 @@ struct ReadEntries<'a, N: 'a + NonVolatileMemory> {
     reader: BufReader<&'a mut JournalNvmBuffer<N>>,
     current: u64,
     is_second_lap: bool,
-    pred_is_go_to_front: bool,
 }
 impl<'a, N: 'a + NonVolatileMemory> ReadEntries<'a, N> {
     fn new(nvm: &'a mut JournalNvmBuffer<N>, head: u64) -> Self {
@@ -344,7 +343,6 @@ impl<'a, N: 'a + NonVolatileMemory> ReadEntries<'a, N> {
             reader: BufReader::new(nvm),
             current: head,
             is_second_lap: false,
-            pred_is_go_to_front: false,
         }
     }
     fn with_capacity(nvm: &'a mut JournalNvmBuffer<N>, head: u64, capacity: usize) -> Self {
@@ -352,23 +350,17 @@ impl<'a, N: 'a + NonVolatileMemory> ReadEntries<'a, N> {
             reader: BufReader::with_capacity(capacity, nvm),
             current: head,
             is_second_lap: false,
-            pred_is_go_to_front: false,
         }
     }
     fn read_record(&mut self) -> Result<Option<JournalRecordWithChecksum>> {
         let result = track!(JournalRecord::read_from(&mut self.reader))?;
-        if self.pred_is_go_to_front {
-            self.pred_is_go_to_front = false;
-            track_assert!(!self.is_second_lap, ErrorKind::StorageCorrupted);
-            track_io!(self.reader.seek(SeekFrom::Start(0)))?;
-            self.current = 0;
-            self.is_second_lap = true;
-            return self.read_record();
-        }
         match result.0 {
             JournalRecord::EndOfRecords => Ok(None),
             JournalRecord::GoToFront => {
-                self.pred_is_go_to_front = true;
+                track_assert!(!self.is_second_lap, ErrorKind::StorageCorrupted);
+                track_io!(self.reader.seek(SeekFrom::Start(0)))?;
+                self.current = 0;
+                self.is_second_lap = true;
                 Ok(Some(result))
             }
             _ => Ok(Some(result)),
@@ -383,7 +375,9 @@ impl<'a, N: 'a + NonVolatileMemory> Iterator for ReadEntries<'a, N> {
             Ok(None) => None,
             Ok(Some(record)) => {
                 let start = Address::from_u64(self.current).expect("Never fails");
-                self.current += record.0.external_size() as u64;
+                if record.0 != JournalRecord::GoToFront {
+                    self.current += record.0.external_size() as u64;
+                }
                 let entry = JournalEntry {
                     start,
                     record: record.0,

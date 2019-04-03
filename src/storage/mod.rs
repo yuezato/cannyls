@@ -444,36 +444,41 @@ mod tests {
 
         let nvm = track!(FileNvm::create(
             dir.path().join("test.lusf"),
-            BlockSize::min().ceil_align(1100 * 100)
+            BlockSize::min().ceil_align(2400 * 100)
         ))?;
         let mut storage = track!(Storage::create(nvm))?;
+        storage.set_automatic_gc_mode(false);
 
-        let vec: Vec<u8> = vec![42; 100];
+        let vec: Vec<u8> = vec![42; 400];
         let lump_data = track!(LumpData::new_embedded(vec))?;
-        for i in 0..6 {
+        for i in 0..3 {
             let id = id(&format!("{}", i));
             track!(storage.put(&id, &lump_data))?;
             if i % 2 == 0 {
                 track!(storage.delete(&id))?;
             }
-            track!(storage.run_side_job_once())?;
+            track!(storage.journal_gc())?;
         }
 
         track!(storage.journal_sync())?;
         {
             let snapshot = track!(storage.journal_snapshot())?;
-            dbg!(snapshot.unreleased_head);
-            dbg!(snapshot.head);
-            dbg!(snapshot.tail);
-            // assert_eq!(snapshot.unreleased_head, 0);
-            // assert_eq!(snapshot.head, 0);
-            // assert_eq!(snapshot.tail, 2100);
+            assert_eq!(snapshot.unreleased_head, 1758);
+            assert_eq!(snapshot.head, 1758);
+            assert_eq!(snapshot.tail, 427);
         }
+        track!(storage.journal_sync())?;
         mem::drop(storage);
 
         // open
         let nvm = track!(FileNvm::open(dir.path().join("test.lusf")))?;
-        // let storage = track!(Storage::open(nvm))?;
+        let mut storage = track!(Storage::open(nvm))?;
+        {
+            let snapshot = track!(storage.journal_snapshot())?;
+            assert_eq!(snapshot.unreleased_head, 1758);
+            assert_eq!(snapshot.head, 1758);
+            assert_eq!(snapshot.tail, 427);
+        }
 
         Ok(())
     }
@@ -739,14 +744,14 @@ mod tests {
 
         let nvm = track!(FileNvm::create(
             dir.path().join("test.lusf"),
-            BlockSize::min().ceil_align(1024 * 400)
+            BlockSize::min().ceil_align(4500 * 100)
         ))?;
         let mut storage = track!(StorageBuilder::new().journal_region_ratio(0.01).create(nvm))?;
         storage.set_automatic_gc_mode(false);
 
         {
             let header = storage.header();
-            assert_eq!(header.journal_region_size, 4096);
+            assert_eq!(header.journal_region_size, 4608);
         }
 
         for i in 0..60 {
@@ -759,24 +764,28 @@ mod tests {
             let snapshot = track!(storage.journal_snapshot())?;
             assert_eq!(snapshot.unreleased_head, 0);
             assert_eq!(snapshot.head, 0);
-            assert_eq!(snapshot.tail, 2100);
+            assert_eq!(snapshot.tail, 2420);
         }
 
         track!(storage.journal_gc())?;
         {
             let snapshot = track!(storage.journal_snapshot())?;
-            assert_eq!(snapshot.unreleased_head, 2100);
-            assert_eq!(snapshot.head, 2100);
-            assert_eq!(snapshot.tail, 3220);
+            assert_eq!(snapshot.unreleased_head, 2420);
+            assert_eq!(snapshot.head, 2420);
+            assert_eq!(snapshot.tail, 3700);
         }
 
         track!(storage.journal_gc())?;
         {
             let snapshot = track!(storage.journal_snapshot())?;
-            assert_eq!(snapshot.unreleased_head, 3220);
-            assert_eq!(snapshot.head, 3220);
-            assert_eq!(snapshot.tail, 784);
+            assert_eq!(snapshot.unreleased_head, 3700);
+            assert_eq!(snapshot.head, 3700);
+            assert_eq!(snapshot.tail, 896);
         }
+
+        std::mem::drop(storage);
+        let nvm = track!(FileNvm::open(dir.path().join("test.lusf")))?;
+        let _storage = track!(Storage::open(nvm))?;
 
         Ok(())
     }
@@ -820,9 +829,9 @@ mod tests {
         track!(storage.run_side_job_once())?; // GCキューを充填する段階で、unreleased headを永続化する。
         {
             let snapshot = storage.journal_snapshot().unwrap();
-            assert_eq!(snapshot.unreleased_head, 33);
-            assert_eq!(snapshot.head, 66);
-            assert_eq!(snapshot.tail, 66);
+            assert_eq!(snapshot.unreleased_head, 37);
+            assert_eq!(snapshot.head, 74);
+            assert_eq!(snapshot.tail, 74);
         }
 
         // (A)が永続化されていることを確認する。
@@ -834,9 +843,9 @@ mod tests {
             // (A)
             // ここで重要なのは、unreleased_headが0でない位置に移動していることだけ。
             let snapshot = storage.journal_snapshot().unwrap();
-            assert_eq!(snapshot.unreleased_head, 33);
-            assert_eq!(snapshot.head, 33); // 再起動後はunreleased_head == headで良い。
-            assert_eq!(snapshot.tail, 66);
+            assert_eq!(snapshot.unreleased_head, 37);
+            assert_eq!(snapshot.head, 37); // 再起動後はunreleased_head == headで良い。
+            assert_eq!(snapshot.tail, 74);
         }
 
         // journalの状態(B) を目指す。
@@ -853,9 +862,9 @@ mod tests {
             // (B)
             // (B)は(C)に入る前準備なので特記するべき状態ではない。
             let snapshot = storage.journal_snapshot().unwrap();
-            assert_eq!(snapshot.unreleased_head, 3198);
-            assert_eq!(snapshot.head, 3198);
-            assert_eq!(snapshot.tail, 3198);
+            assert_eq!(snapshot.unreleased_head, 3230);
+            assert_eq!(snapshot.head, 3230);
+            assert_eq!(snapshot.tail, 3230);
         }
         /*
          * ジャーナル領域のhead positionはunreleased_headの値と常に等しいため
@@ -876,9 +885,9 @@ mod tests {
             // (C)
             // 位置33の周辺を値`42`で上書きした状態。
             let snapshot = storage.journal_snapshot().unwrap();
-            assert_eq!(snapshot.unreleased_head, 3198);
-            assert_eq!(snapshot.head, 3198);
-            assert_eq!(snapshot.tail, 2023);
+            assert_eq!(snapshot.unreleased_head, 3230);
+            assert_eq!(snapshot.head, 3230);
+            assert_eq!(snapshot.tail, 2027);
         }
 
         // storageがcrashして再起動する操作群を模倣する。
@@ -887,9 +896,9 @@ mod tests {
         let mut storage = track!(Storage::open(nvm))?;
         {
             let snapshot = storage.journal_snapshot().unwrap();
-            assert_eq!(snapshot.unreleased_head, 3198);
-            assert_eq!(snapshot.head, 3198);
-            assert_eq!(snapshot.tail, 2023);
+            assert_eq!(snapshot.unreleased_head, 3230);
+            assert_eq!(snapshot.head, 3230);
+            assert_eq!(snapshot.tail, 2027);
         }
 
         Ok(())

@@ -58,30 +58,6 @@ impl<T: AsRef<[u8]>> JournalRecord<T> {
         }
     }
 
-    /// デバッグ用のヘルパ関数
-    pub fn dump(&self) {
-        match *self {
-            JournalRecord::EndOfRecords => {
-                println!("EndOfRecords");
-            }
-            JournalRecord::GoToFront => {
-                println!("GoToFront");
-            }
-            JournalRecord::Put(lumpid, _) => {
-                println!("Put {:?}", lumpid);
-            }
-            JournalRecord::Embed(lumpid, _) => {
-                println!("Embed {:?}", lumpid);
-            }
-            JournalRecord::Delete(lumpid) => {
-                println!("Delete {:?}", lumpid);
-            }
-            JournalRecord::DeleteRange(_) => {
-                println!("DeleteRange");
-            }
-        }
-    }
-
     /// 読み書き時のサイズ（バイト数）を返す.
     pub(crate) fn external_size(&self) -> usize {
         let record_size = match *self {
@@ -99,14 +75,6 @@ impl<T: AsRef<[u8]>> JournalRecord<T> {
         let checksum = self.checksum();
         track_io!(writer.write_u32::<BigEndian>(checksum))?;
         track_io!(writer.write_u32::<BigEndian>(prev_checksum))?;
-
-        println!("<WRITE_TO>");
-        self.dump();
-        println!(
-            "checksum = {:x}, prev_checksum = {:x}",
-            checksum, prev_checksum
-        );
-        println!("</WRITE_TO>");
 
         match *self {
             JournalRecord::EndOfRecords => {
@@ -225,11 +193,6 @@ impl JournalRecord<Vec<u8>> {
                 tag
             ),
         };
-        println!(
-            "record.checksum = {:x}, checksum = {:x}",
-            record.checksum(),
-            checksum
-        );
         track_assert_eq!(record.checksum(), checksum, ErrorKind::StorageCorrupted);
         Ok(JournalRecordWithChecksum(record, prev_checksum))
     }
