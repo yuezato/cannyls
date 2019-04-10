@@ -2,7 +2,7 @@ use prometrics::metrics::MetricBuilder;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use super::record::{EMBEDDED_DATA_OFFSET, END_OF_RECORDS_SIZE};
-use super::{JournalEntry, JournalNvmBuffer, JournalRecord};
+use super::{JournalEntry, JournalNvmBuffer, JournalRecord, JournalRecordWithCheckSum};
 use lump::LumpId;
 use metrics::JournalQueueMetrics;
 use nvm::NonVolatileMemory;
@@ -108,20 +108,35 @@ impl<N: NonVolatileMemory> JournalRingBuffer<N> {
         track!(self.nvm.sync())
     }
 
+    pub fn enqueue<B: AsRef<[u8]>>(
+        &mut self,
+        record: &JournalRecord<B>,
+    ) -> Result<Option<(LumpId, JournalPortion)>> {
+        track!(self.enqueue_with_checksum(0xdeadbeaf, record))
+    }
+
     /// レコードをジャーナルの末尾に追記する.
     ///
     /// レコードが`JournalRecord::Embed`だった場合には、データを埋め込んだ位置を結果として返す.
-    pub fn enqueue<B: AsRef<[u8]>>(
+    fn enqueue_with_checksum<B: AsRef<[u8]>>(
         &mut self,
+        prev_checksum: u32,
         record: &JournalRecord<B>,
     ) -> Result<Option<(LumpId, JournalPortion)>> {
         // 1. 十分な空き領域が存在するかをチェック
         track!(self.check_free_space(record))?;
 
         // 2. リングバッファの終端チェック
-        if self.will_overflow(record) {
+        if self.will_overflow(&record) {
+            // GoToFrontをディスクに書き出す
             track_io!(self.nvm.seek(SeekFrom::Start(self.tail)))?;
-            track!(JournalRecord::GoToFront::<[_; 0]>.write_to(&mut self.nvm))?;
+            let go_to_front = JournalRecord::GoToFront::<[_; 0]>;
+            track!(JournalRecordWithCheckSum::write_with_checksum(
+                &mut self.nvm,
+                prev_checksum,
+                &go_to_front
+            ));
+            track!(self.sync())?;
 
             // 先頭に戻って再試行
             self.metrics
@@ -129,14 +144,16 @@ impl<N: NonVolatileMemory> JournalRingBuffer<N> {
                 .add_u64(self.nvm.capacity() - self.tail);
             self.tail = 0;
             debug_assert!(!self.will_overflow(record));
-            return self.enqueue(record);
+            return self.enqueue_with_checksum(record);
         }
 
         // 3. レコードを書き込む
         let prev_tail = self.tail;
         track_io!(self.nvm.seek(SeekFrom::Start(self.tail)))?;
         track!(record.write_to(&mut self.nvm))?;
-        self.metrics.enqueued_records_at_running.increment(record);
+        self.metrics
+            .enqueued_records_at_running
+            .increment(&record.body());
 
         // 4. 終端を示すレコードも書き込む
         self.tail = self.nvm.position(); // 次回の追記開始位置を保存 (`EndOfRecords`の直前)
@@ -146,7 +163,7 @@ impl<N: NonVolatileMemory> JournalRingBuffer<N> {
         track!(JournalRecord::EndOfRecords::<[_; 0]>.write_to(&mut self.nvm))?;
 
         // 5. 埋め込みPUTの場合には、インデックスに位置情報を返す
-        if let JournalRecord::Embed(ref lump_id, ref data) = *record {
+        if let JournalRecord::Embed(ref lump_id, ref data) = record.body() {
             let portion = JournalPortion {
                 start: Address::from_u64(prev_tail + EMBEDDED_DATA_OFFSET as u64).unwrap(),
                 len: data.as_ref().len() as u16,
@@ -178,7 +195,7 @@ impl<N: NonVolatileMemory> JournalRingBuffer<N> {
     }
 
     /// `record`を書き込んだら、リングバッファ用の領域を超えてしまうかどうかを判定する.
-    fn will_overflow<B: AsRef<[u8]>>(&self, record: &JournalRecord<B>) -> bool {
+    fn will_overflow<B: AsRef<[u8]>>(&self, record: &JournalRecordWithCheckSum<B>) -> bool {
         let mut next_tail = self.tail + record.external_size() as u64;
 
         // `EndOfRecords`は常に末尾に書き込まれるので、その分のサイズも考慮する
@@ -188,7 +205,10 @@ impl<N: NonVolatileMemory> JournalRingBuffer<N> {
     }
 
     /// `record`の書き込みを行うことで、リングバッファのTAILがHEADを追い越してしまう危険性がないかを確認する.
-    fn check_free_space<B: AsRef<[u8]>>(&mut self, record: &JournalRecord<B>) -> Result<()> {
+    fn check_free_space<B: AsRef<[u8]>>(
+        &mut self,
+        record: &JournalRecordWithCheckSum<B>,
+    ) -> Result<()> {
         // 書き込みの物理的な終端位置を計算
         let write_end = self.tail + (record.external_size() + END_OF_RECORDS_SIZE) as u64;
 
@@ -252,7 +272,7 @@ impl<'a, N: 'a + NonVolatileMemory> Iterator for RestoredEntries<'a, N> {
             Some(Ok(ref entry)) => {
                 self.metrics
                     .enqueued_records_at_starting
-                    .increment(&entry.record);
+                    .increment(&entry.record.body());
                 *self.tail = entry.end().as_u64();
             }
             None => {
@@ -290,7 +310,9 @@ impl<'a, N: 'a + NonVolatileMemory> Iterator for DequeuedEntries<'a, N> {
     fn next(&mut self) -> Option<Self::Item> {
         let next = self.entries.next();
         if let Some(Ok(ref entry)) = next {
-            self.metrics.dequeued_records.increment(&entry.record);
+            self.metrics
+                .dequeued_records
+                .increment(&entry.record.body());
             *self.head = entry.end().as_u64();
         }
         next
@@ -318,8 +340,9 @@ impl<'a, N: 'a + NonVolatileMemory> ReadEntries<'a, N> {
             is_second_lap: false,
         }
     }
-    fn read_record(&mut self) -> Result<Option<JournalRecord<Vec<u8>>>> {
-        match track!(JournalRecord::read_from(&mut self.reader))? {
+    fn read_record(&mut self) -> Result<Option<JournalRecordWithCheckSum<Vec<u8>>>> {
+        let record = track!(JournalRecordWithCheckSum::read_from(&mut self.reader))?;
+        match record.body() {
             JournalRecord::EndOfRecords => Ok(None),
             JournalRecord::GoToFront => {
                 track_assert!(!self.is_second_lap, ErrorKind::StorageCorrupted);
@@ -328,7 +351,7 @@ impl<'a, N: 'a + NonVolatileMemory> ReadEntries<'a, N> {
                 self.is_second_lap = true;
                 self.read_record()
             }
-            record => Ok(Some(record)),
+            _ => Ok(Some(record)),
         }
     }
 }
@@ -372,16 +395,16 @@ mod tests {
             record_delete("444"),
             record_delete_range("000", "999"),
         ];
-        for record in &records {
+        for record in records {
             assert!(ring.enqueue(record).is_ok());
         }
 
         let mut position = Address::from(0);
         for (entry, record) in track!(ring.dequeue_iter())?.zip(records.iter()) {
             let entry = track!(entry)?;
-            assert_eq!(entry.record, *record);
+            assert_eq!(*entry.record.body(), *record);
             assert_eq!(entry.start, position);
-            position = position + Address::from(record.external_size() as u32);
+            position = position + Address::from(entry.record.external_size() as u32);
         }
 
         assert_eq!(ring.unreleased_head, 0);
@@ -397,11 +420,11 @@ mod tests {
         let nvm = MemoryNvm::new(vec![0; 1024]);
         let mut ring = JournalRingBuffer::new(nvm, 0, &MetricBuilder::new());
 
-        track!(ring.enqueue(&record_put("000", 30, 5)))?;
-        track!(ring.enqueue(&record_delete("111")))?;
+        track!(ring.enqueue(record_put("000", 30, 5)))?;
+        track!(ring.enqueue(record_delete("111")))?;
 
         let (lump_id, portion) =
-            track!(ring.enqueue(&record_embed("222", b"foo")))?.expect("Some(_)");
+            track!(ring.enqueue(record_embed("222", b"foo")))?.expect("Some(_)");
         assert_eq!(lump_id, track_any_err!("222".parse())?);
 
         let mut buf = vec![0; portion.len as usize];
@@ -419,11 +442,11 @@ mod tests {
 
         let record = record_delete("000");
         for _ in 0..(512 / record.external_size()) {
-            track!(ring.enqueue(&record))?;
+            track!(ring.enqueue(record))?;
         }
         assert_eq!(ring.tail, 1016);
 
-        track!(ring.enqueue(&record))?;
+        track!(ring.enqueue(record))?;
         assert_eq!(ring.tail, 21);
         Ok(())
     }
@@ -435,12 +458,12 @@ mod tests {
 
         let record = record_put("000", 1, 2);
         while ring.tail <= 1024 - record.external_size() as u64 {
-            track!(ring.enqueue(&record))?;
+            track!(ring.enqueue(record))?;
         }
         assert_eq!(ring.tail, 1008);
 
         assert_eq!(
-            ring.enqueue(&record).err().map(|e| *e.kind()),
+            ring.enqueue(record).err().map(|e| *e.kind()),
             Some(ErrorKind::StorageFull)
         );
         assert_eq!(ring.tail, 1008);
@@ -448,13 +471,13 @@ mod tests {
         ring.unreleased_head = 511;
         ring.head = 511;
         assert_eq!(
-            ring.enqueue(&record).err().map(|e| *e.kind()),
+            ring.enqueue(record).err().map(|e| *e.kind()),
             Some(ErrorKind::StorageFull)
         );
 
         ring.unreleased_head = 512;
         ring.head = 512;
-        assert!(ring.enqueue(&record).is_ok());
+        assert!(ring.enqueue(record).is_ok());
         assert_eq!(ring.tail, record.external_size() as u64);
         Ok(())
     }
@@ -467,13 +490,13 @@ mod tests {
         let record = record_embed("000", &vec![0; 997]);
         assert_eq!(record.external_size(), 1020);
         assert_eq!(
-            ring.enqueue(&record).err().map(|e| *e.kind()),
+            ring.enqueue(record).err().map(|e| *e.kind()),
             Some(ErrorKind::StorageFull)
         );
 
         let record = record_embed("000", &vec![0; 996]);
         assert_eq!(record.external_size(), 1019);
-        assert!(ring.enqueue(&record).is_ok());
+        assert!(ring.enqueue(record).is_ok());
         assert_eq!(ring.tail, 1019);
     }
 

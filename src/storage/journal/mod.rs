@@ -1,7 +1,7 @@
 pub use self::header::{JournalHeader, JournalHeaderRegion};
 pub use self::nvm_buffer::JournalNvmBuffer;
 pub use self::options::JournalRegionOptions;
-pub use self::record::{JournalEntry, JournalRecord};
+pub use self::record::{JournalEntry, JournalRecord, JournalRecordWithCheckSum};
 pub use self::region::JournalRegion;
 
 mod header;

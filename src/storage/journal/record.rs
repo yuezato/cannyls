@@ -29,7 +29,7 @@ pub struct JournalEntry {
     pub start: Address,
 
     /// レコード.
-    pub record: JournalRecord<Vec<u8>>,
+    pub record: JournalRecordWithCheckSum<Vec<u8>>,
 }
 impl JournalEntry {
     /// ジャーナル内でのレコードの終端位置を返す.
@@ -49,8 +49,18 @@ pub enum JournalRecord<T> {
     Delete(LumpId),
     DeleteRange(Range<LumpId>),
 }
+
 impl<T: AsRef<[u8]>> JournalRecord<T> {
-    /// 読み書き時のサイズ（バイト数）を返す.
+    pub(crate) fn size(&self) -> usize {
+        let record_size = match *self {
+            JournalRecord::EndOfRecords | JournalRecord::GoToFront => 0,
+            JournalRecord::Put(..) => LumpId::SIZE + LENGTH_SIZE + PORTION_SIZE,
+            JournalRecord::Embed(_, ref data) => LumpId::SIZE + LENGTH_SIZE + data.as_ref().len(),
+            JournalRecord::Delete(..) => LumpId::SIZE,
+            JournalRecord::DeleteRange(..) => LumpId::SIZE * 2,
+        };
+        TAG_SIZE + record_size
+    }
     pub(crate) fn external_size(&self) -> usize {
         let record_size = match *self {
             JournalRecord::EndOfRecords | JournalRecord::GoToFront => 0,
@@ -59,12 +69,9 @@ impl<T: AsRef<[u8]>> JournalRecord<T> {
             JournalRecord::Delete(..) => LumpId::SIZE,
             JournalRecord::DeleteRange(..) => LumpId::SIZE * 2,
         };
-        CHECKSUM_SIZE + TAG_SIZE + record_size
+        (2 * CHECKSUM_SIZE) + TAG_SIZE + record_size
     }
-
-    /// `writer`にレコードを書き込む.
     pub(crate) fn write_to<W: Write>(&self, mut writer: W) -> Result<()> {
-        track_io!(writer.write_u32::<BigEndian>(self.checksum()))?;
         match *self {
             JournalRecord::EndOfRecords => {
                 track_io!(writer.write_u8(TAG_END_OF_RECORDS))?;
@@ -97,9 +104,7 @@ impl<T: AsRef<[u8]>> JournalRecord<T> {
         }
         Ok(())
     }
-
-    fn checksum(&self) -> u32 {
-        let mut adler32 = RollingAdler32::new();
+    pub(crate) fn update_adler32(&self, adler32: &mut adler32::RollingAdler32) {
         match *self {
             JournalRecord::EndOfRecords => {
                 adler32.update(TAG_END_OF_RECORDS);
@@ -134,13 +139,10 @@ impl<T: AsRef<[u8]>> JournalRecord<T> {
                 adler32.update_buffer(&lump_id_to_u128(&range.end)[..]);
             }
         }
-        adler32.hash()
     }
 }
 impl JournalRecord<Vec<u8>> {
-    /// `reader`からレコードを読み込む.
     pub(crate) fn read_from<R: Read>(mut reader: R) -> Result<Self> {
-        let checksum = track_io!(reader.read_u32::<BigEndian>())?;
         let tag = track_io!(reader.read_u8())?;
         let record = match tag {
             TAG_END_OF_RECORDS => JournalRecord::EndOfRecords,
@@ -176,6 +178,81 @@ impl JournalRecord<Vec<u8>> {
                 "Unknown journal record tag: {}",
                 tag
             ),
+        };
+        Ok(record)
+    }
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct JournalRecordWithCheckSum<T> {
+    prev_checksum: u32, // 自分の一つ前のJournalRecordのchecksumを記録する。
+    inner: JournalRecord<T>,
+}
+
+impl<T: AsRef<[u8]>> JournalRecordWithCheckSum<T> {
+    pub(crate) fn new(prev_checksum: u32, inner: JournalRecord<T>) -> Self {
+        JournalRecordWithCheckSum {
+            prev_checksum,
+            inner,
+        }
+    }
+
+    /// 読み書き時のサイズ（バイト数）を返す.
+    pub(crate) fn external_size(&self) -> usize {
+        let record_size = CHECKSUM_SIZE + self.inner.size();
+        CHECKSUM_SIZE + record_size
+    }
+
+    /// `writer`にレコードを書き込む.
+    pub(crate) fn write_to<W: Write>(&self, mut writer: W) -> Result<()> {
+        track_io!(writer.write_u32::<BigEndian>(self.checksum()))?;
+        track_io!(writer.write_u32::<BigEndian>(self.prev_checksum))?;
+        track!(self.inner.write_to(writer))?;
+        Ok(())
+    }
+
+    /// `writer`にレコードを書き込む.
+    pub(crate) fn write_with_checksum<W: Write>(
+        mut writer: W,
+        prev_checksum: u32,
+        record: JournalRecord<T>,
+    ) -> Result<()> {
+        let mut adler32 = RollingAdler32::new();
+        adler32.update_buffer(&prev_checksum.to_be_bytes());
+        record.update_adler32(&mut adler32);
+        let checksum = adler32.hash();
+
+        track_io!(writer.write_u32::<BigEndian>(checksum))?;
+        track_io!(writer.write_u32::<BigEndian>(prev_checksum))?;
+        track!(record.write_to(writer))?;
+        Ok(())
+    }
+
+    fn checksum(&self) -> u32 {
+        let mut adler32 = RollingAdler32::new();
+        adler32.update_buffer(&self.prev_checksum.to_be_bytes());
+        self.inner.update_adler32(&mut adler32);
+        adler32.hash()
+    }
+
+    pub(crate) fn body(&self) -> &JournalRecord<T> {
+        &self.inner
+    }
+
+    pub(crate) fn take_body(self) -> JournalRecord<T> {
+        self.inner
+    }
+}
+impl JournalRecordWithCheckSum<Vec<u8>> {
+    /// `reader`からレコードを読み込む.
+    pub(crate) fn read_from<R: Read>(mut reader: R) -> Result<Self> {
+        let checksum = track_io!(reader.read_u32::<BigEndian>())?;
+        let prev_checksum = track_io!(reader.read_u32::<BigEndian>())?;
+        let inner = track!(JournalRecord::read_from(reader))?;
+        let record = JournalRecordWithCheckSum {
+            prev_checksum,
+            inner,
         };
         track_assert_eq!(record.checksum(), checksum, ErrorKind::StorageCorrupted);
         Ok(record)

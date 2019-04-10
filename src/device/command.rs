@@ -63,11 +63,12 @@ impl<T> Future for AsyncResult<T> {
     type Item = T;
     type Error = Error;
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        track!(self.0.poll().map_err(|e| e.unwrap_or_else(|| {
-            ErrorKind::DeviceTerminated
+        track!(self
+            .0
+            .poll()
+            .map_err(|e| e.unwrap_or_else(|| ErrorKind::DeviceTerminated
                 .cause("monitoring channel disconnected")
-                .into()
-        })))
+                .into())))
     }
 }
 

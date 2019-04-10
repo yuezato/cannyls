@@ -178,7 +178,7 @@ where
             self.metrics.gc_dequeued_records.increment();
             if !self.is_garbage(index, &entry) {
                 // まだ回収できない場合には、ジャーナル領域の「末尾に」追加する
-                track!(self.append_record(index, &entry.record))?;
+                track!(self.append_record(index, entry.record.body()))?;
                 break;
             }
         }
@@ -286,7 +286,7 @@ where
 
     /// エントリが回収可能かどうかを判定する.
     fn is_garbage(&self, index: &LumpIndex, entry: &JournalEntry) -> bool {
-        match entry.record {
+        match entry.record.body() {
             JournalRecord::Put(ref lump_id, ref portion) => {
                 index.get(lump_id) != Some(Portion::Data(*portion))
             }
@@ -330,7 +330,7 @@ where
     fn restore(&mut self, index: &mut LumpIndex) -> Result<()> {
         for result in track!(self.ring_buffer.restore_entries())? {
             let JournalEntry { start, record } = track!(result)?;
-            match record {
+            match record.take_body() {
                 JournalRecord::Put(lump_id, portion) => {
                     index.insert(lump_id, Portion::Data(portion));
                 }
