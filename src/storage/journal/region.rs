@@ -65,7 +65,7 @@ where
         index: &mut LumpIndex,
         metric_builder: &MetricBuilder,
         options: JournalRegionOptions,
-    ) -> Result<JournalRegion<N>>
+    ) -> Result<(JournalRegion<N>, usize)>
     where
         N: NonVolatileMemory,
     {
@@ -93,8 +93,8 @@ where
             options,
             gc_after_append: true,
         };
-        track!(journal.restore(index))?;
-        Ok(journal)
+        let num_of_delete_records = track!(journal.restore(index))?;
+        Ok((journal, num_of_delete_records))
     }
 
     /// PUT操作をジャーナルに記録する.
@@ -148,18 +148,20 @@ where
     }
 
     /// 補助タスクを一単位実行する.
-    pub fn run_side_job_once(&mut self, index: &mut LumpIndex) -> Result<()> {
+    pub fn run_side_job_once(&mut self, index: &mut LumpIndex) -> Result<Option<usize>> {
         if self.gc_queue.is_empty() {
-            track!(self.fill_gc_queue())?;
+            let num = track!(self.fill_gc_queue())?;
+            Ok(Some(num))
         } else if self.sync_countdown != self.options.sync_interval {
             track!(self.sync())?;
+            Ok(None)
         } else {
             for _ in 0..GC_COUNT_IN_SIDE_JOB {
                 track!(self.gc_once(index))?;
             }
             track!(self.try_sync())?;
+            Ok(None)
         }
-        Ok(())
     }
 
     /// ジャーナル領域用のメトリクスを返す.
@@ -303,7 +305,8 @@ where
     /// GC用のキューの内容を補填する.
     ///
     /// 必要に応じて、ジャーナルヘッダの更新も行う.
-    fn fill_gc_queue(&mut self) -> Result<()> {
+    fn fill_gc_queue(&mut self) -> Result<usize> {
+        let mut num_of_delete_records = 0;
         assert!(self.gc_queue.is_empty());
 
         // GCキューが空 `gc_queue.is_empty() == true`
@@ -314,22 +317,32 @@ where
         track!(self.write_journal_header(ring_buffer_head))?;
 
         if self.ring_buffer.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         for result in track!(self.ring_buffer.dequeue_iter())?.take(self.options.gc_queue_size) {
             let entry = track!(result)?;
+
+            match entry.record {
+                JournalRecord::Delete(_) => {
+                    num_of_delete_records += 1;
+                }
+                _ => {}
+            }
+
             self.gc_queue.push_back(entry);
         }
 
         self.metrics
             .gc_enqueued_records
             .add_u64(self.gc_queue.len() as u64);
-        Ok(())
+        Ok(num_of_delete_records)
     }
 
     /// リングバッファおよびインデックスを前回の状態に復元する.
-    fn restore(&mut self, index: &mut LumpIndex) -> Result<()> {
+    fn restore(&mut self, index: &mut LumpIndex) -> Result<usize> {
+        let mut num_of_delete_records = 0;
+
         for result in track!(self.ring_buffer.restore_entries())? {
             let JournalEntry { start, record } = track!(result)?;
             match record {
@@ -344,6 +357,7 @@ where
                     index.insert(lump_id, Portion::Journal(portion));
                 }
                 JournalRecord::Delete(lump_id) => {
+                    num_of_delete_records += 1;
                     index.remove(&lump_id);
                 }
                 JournalRecord::DeleteRange(range) => {
@@ -354,6 +368,7 @@ where
                 JournalRecord::EndOfRecords | JournalRecord::GoToFront => unreachable!(),
             }
         }
-        Ok(())
+
+        Ok(num_of_delete_records)
     }
 }

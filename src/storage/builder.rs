@@ -186,7 +186,7 @@ impl StorageBuilder {
         // ジャーナルからインデックスとアロケータの状態を復元する
         let mut lump_index = LumpIndex::new();
         let (journal_nvm, data_nvm) = track!(header.split_regions(nvm))?;
-        let journal_region = track!(JournalRegion::open(
+        let (journal_region, num_of_delete_records) = track!(JournalRegion::open(
             journal_nvm,
             &mut lump_index,
             &self.metrics,
@@ -211,6 +211,7 @@ impl StorageBuilder {
         Ok(Storage::new(
             header,
             journal_region,
+            num_of_delete_records,
             data_region,
             lump_index,
             metrics,

@@ -23,7 +23,7 @@ pub(crate) use self::data_region::DataRegionLumpData; // `lump`モジュール�
 use self::data_region::DataRegion;
 use self::index::LumpIndex;
 use self::journal::JournalRegion;
-use self::portion::Portion;
+use self::portion::{Portion, PortionU64};
 use block::BlockSize;
 use lump::{LumpData, LumpDataInner, LumpHeader, LumpId};
 use metrics::StorageMetrics;
@@ -83,6 +83,7 @@ where
     data_region: DataRegion<N>,
     lump_index: LumpIndex,
     metrics: StorageMetrics,
+    delete_buffer: Vec<Option<PortionU64>>,
 }
 impl<N> Storage<N>
 where
@@ -91,6 +92,7 @@ where
     pub(crate) fn new(
         header: StorageHeader,
         journal_region: JournalRegion<N>,
+        num_of_delete_records: usize,
         data_region: DataRegion<N>,
         lump_index: LumpIndex,
         metrics: StorageMetrics,
@@ -101,6 +103,7 @@ where
             data_region,
             lump_index,
             metrics,
+            delete_buffer: vec![None; num_of_delete_records],
         }
     }
 
@@ -194,7 +197,8 @@ where
     /// NVMへの書き込み前に、データをブロック境界にアライメントするためのメモリコピーが余分に発生してしまう.
     /// それを避けたい場合には、`Storage::allocate_lump_data`メソッドを使用して`LumpData`を生成すると良い.
     pub fn put(&mut self, lump_id: &LumpId, data: &LumpData) -> Result<bool> {
-        let updated = track!(self.delete_if_exists(lump_id, false))?;
+        // put時も上書きするならばdelete recordを書き込む
+        let updated = track!(self.delete_if_exists(lump_id, true))?;
         match data.as_inner() {
             LumpDataInner::JournalRegion(data) => {
                 track!(self
@@ -248,21 +252,13 @@ where
         // ジャーナル領域に範囲削除レコードを一つ書き込むため、一度のディスクアクセスが起こる。
         // 削除レコードを範囲分書き込むわけ *ではない* ため、複数回のディスクアクセスは発生しない。
         track!(self
-               .journal_region
-               .records_delete_range(&mut self.lump_index, range))?;
-        
-        for lump_id in &targets {
-            if let Some(portion) = self.lump_index.remove(lump_id) {
-                self.metrics.delete_lumps.increment();
+            .journal_region
+            .records_delete_range(&mut self.lump_index, range))?;
 
-                if let Portion::Data(portion) = portion {
-                    // DataRegion::deleteはメモリアロケータに対する解放要求をするのみで
-                    // ディスクにアクセスすることはない。
-                    // （管理領域から外すだけで、例えばディスク上の値を0クリアするようなことはない）
-                    self.data_region.delete(portion);
-                }
-            }
-        }        
+        for lump_id in &targets {
+            self.delete_if_exists(lump_id, false)
+                .expect("when do_record==false, this method never raises an error");
+        }
 
         Ok(targets)
     }
@@ -306,7 +302,19 @@ where
     /// リソースが空いているタイミングで実行することによって、
     /// 全体的な性能を改善できる可能性がある.
     pub fn run_side_job_once(&mut self) -> Result<()> {
-        track!(self.journal_region.run_side_job_once(&mut self.lump_index))?;
+        if let Some(num) = track!(self.journal_region.run_side_job_once(&mut self.lump_index))? {
+            // num個のdelete recordを見つけたので、前からnum個を解放する。
+            for portion in self.delete_buffer.drain(0..num) {
+                if let Some(portion) = portion {
+                    let portion = Portion::from(portion);
+                    if let Portion::Data(data_portion) = portion {
+                        self.data_region.delete(data_portion);
+                    } else {
+                        unreachable!();
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -360,6 +368,8 @@ where
             .journal_region
             .records_put(&mut self.lump_index, lump_id, portion)
             .map_err(|e| {
+                // ジャーナルへのPUTの書き込みに失敗した場合なので
+                // `portion`は直ちに再利用可能とできる。
                 self.data_region.delete(portion);
                 e
             }))?;
@@ -368,6 +378,12 @@ where
         Ok(())
     }
 
+    /*
+     * 返り値 Ok(b1, b2) について
+     * b1: true = 実際に存在するデータを削除した
+     *   b2: true = 削除したのはEmbedded Put, false = 削除したのはData Put
+     * b2: false = 削除していない
+     */
     fn delete_if_exists(&mut self, lump_id: &LumpId, do_record: bool) -> Result<bool> {
         if let Some(portion) = self.lump_index.remove(lump_id) {
             self.metrics.delete_lumps.increment();
@@ -376,8 +392,9 @@ where
                     .journal_region
                     .records_delete(&mut self.lump_index, lump_id,))?;
             }
-            if let Portion::Data(portion) = portion {
-                self.data_region.delete(portion);
+            if let Portion::Data(_data_portion) = portion {
+                // self.data_region.delete(data_portion); // ここではまだ解放を行わない
+                self.delete_buffer.push(Some(PortionU64::from(portion)));
             }
             Ok(true)
         } else {
