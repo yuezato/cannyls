@@ -6,6 +6,7 @@ use block::{AlignedBytes, BlockSize};
 use metrics::DataRegionMetrics;
 use nvm::NonVolatileMemory;
 use storage::allocator::DataPortionAllocator;
+use storage::huge_pool::HugePool;
 use storage::portion::DataPortion;
 use {ErrorKind, Result};
 
@@ -19,6 +20,7 @@ pub struct DataRegion<N> {
     nvm: N,
     block_size: BlockSize,
     metrics: DataRegionMetrics,
+    huge_pool: HugePool,
 }
 impl<N> DataRegion<N>
 where
@@ -29,11 +31,18 @@ where
         let capacity = allocator.metrics().capacity_bytes;
         let block_size = allocator.metrics().block_size;
         let allocator_metrics = allocator.metrics().clone();
-        DataRegion {
-            allocator,
-            nvm,
-            block_size,
-            metrics: DataRegionMetrics::new(metric_builder, capacity, allocator_metrics),
+
+        if let Some(huge_pool) = HugePool::new(10 * 1024 * 1024) {
+            // ^---- 10MB alloc
+            DataRegion {
+                allocator,
+                nvm,
+                block_size,
+                metrics: DataRegionMetrics::new(metric_builder, capacity, allocator_metrics),
+                huge_pool,
+            }
+        } else {
+            panic!("[HugePool Error]");
         }
     }
 
@@ -59,7 +68,21 @@ where
 
         let (offset, _size) = self.real_portion(&portion);
         track_io!(self.nvm.seek(SeekFrom::Start(offset)))?;
-        track!(data.write_to(&mut self.nvm))?;
+
+        // track!(data.write_to(&mut self.nvm))?;
+        unsafe {
+            std::ptr::copy(
+                data.as_external_bytes().as_ptr(),
+                self.huge_pool.as_mutref(),
+                data.as_external_bytes().len(),
+            );
+            track_io!(self
+                .nvm
+                .write_all(self.huge_pool.to_slice(data.as_external_bytes().len())))?;
+
+            // original
+            // track/io!(self.nvm.write_all(data.as_external_bytes()))?;
+        }
 
         // NOTE:
         // この後にジャーナルへの書き込みが行われ、
