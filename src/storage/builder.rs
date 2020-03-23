@@ -6,7 +6,7 @@ use block::BlockSize;
 use metrics::{DataAllocatorMetrics, StorageMetrics};
 use nvm::NonVolatileMemory;
 use storage::allocator::DataPortionAllocator;
-use storage::data_region::DataRegion;
+use storage::data_region::{DataRegion, DataRegionOptions};
 use storage::header::FULL_HEADER_SIZE;
 use storage::index::LumpIndex;
 use storage::journal::{JournalRegion, JournalRegionOptions};
@@ -23,6 +23,7 @@ pub struct StorageBuilder {
     instance_uuid: Option<Uuid>,
     journal: JournalRegionOptions,
     metrics: MetricBuilder,
+    data: DataRegionOptions,
 }
 impl StorageBuilder {
     /// 新しい`StorageBuilder`インスタンスを生成する.
@@ -32,6 +33,7 @@ impl StorageBuilder {
             instance_uuid: None,
             journal: JournalRegionOptions::default(),
             metrics: MetricBuilder::new(),
+            data: DataRegionOptions::default(),
         }
     }
 
@@ -91,6 +93,11 @@ impl StorageBuilder {
         self
     }
 
+    pub fn hugepool_on_data(&mut self, enable: bool) -> &mut Self {
+        self.data.use_huge_pool = enable;
+        self
+    }
+    
     /// ストレージのブロックサイズを指定する.
     ///
     /// ここで指定した値は、ストレージの生成時にのみ使われる.
@@ -199,7 +206,7 @@ impl StorageBuilder {
         ))?;
 
         // データ領域を準備
-        let data_region = DataRegion::new(&self.metrics, allocator, data_nvm);
+        let data_region = DataRegion::new(&self.metrics, allocator, data_nvm, self.data.use_huge_pool);
 
         let metrics = StorageMetrics::new(
             &self.metrics,

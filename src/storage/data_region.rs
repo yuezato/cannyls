@@ -13,6 +13,18 @@ use {ErrorKind, Result};
 /// 各データの末尾に埋め込まれる情報のサイズ.
 const LUMP_DATA_TRAILER_SIZE: usize = 2;
 
+#[derive(Debug, Clone)]
+pub struct DataRegionOptions {
+    pub use_huge_pool: bool,
+}
+impl Default for DataRegionOptions {
+    fn default() -> Self {
+        DataRegionOptions {
+            use_huge_pool: false,
+        }
+    }
+}
+
 /// ランプのデータを格納するための領域.
 #[derive(Debug)]
 pub struct DataRegion<N> {
@@ -20,29 +32,33 @@ pub struct DataRegion<N> {
     nvm: N,
     block_size: BlockSize,
     metrics: DataRegionMetrics,
-    huge_pool: HugePool,
+    huge_pool: Option<HugePool>,
 }
 impl<N> DataRegion<N>
 where
     N: NonVolatileMemory,
 {
     /// 新しい`DataRegion`インスタンスを生成する.
-    pub fn new(metric_builder: &MetricBuilder, allocator: DataPortionAllocator, nvm: N) -> Self {
+    pub fn new(metric_builder: &MetricBuilder, allocator: DataPortionAllocator, nvm: N, use_huge_pool: bool) -> Self {
         let capacity = allocator.metrics().capacity_bytes;
         let block_size = allocator.metrics().block_size;
         let allocator_metrics = allocator.metrics().clone();
 
-        if let Some(huge_pool) = HugePool::new(10 * 1024 * 1024) {
-            // ^---- 10MB alloc
-            DataRegion {
-                allocator,
-                nvm,
-                block_size,
-                metrics: DataRegionMetrics::new(metric_builder, capacity, allocator_metrics),
-                huge_pool,
+        let mut huge_pool = None;
+        if use_huge_pool {
+            if let Some(huge_pool_) = HugePool::new(10 * 1024 * 1024) {
+                // ^---- 10MB alloc
+                huge_pool = Some(huge_pool_);
+            } else {
+                panic!("[HugePool Error]");
             }
-        } else {
-            panic!("[HugePool Error]");
+        };
+        DataRegion {
+            allocator,
+            nvm,
+            block_size,
+            metrics: DataRegionMetrics::new(metric_builder, capacity, allocator_metrics),
+            huge_pool,
         }
     }
 
@@ -69,21 +85,22 @@ where
         let (offset, _size) = self.real_portion(&portion);
         track_io!(self.nvm.seek(SeekFrom::Start(offset)))?;
 
-        // track!(data.write_to(&mut self.nvm))?;
-        unsafe {
-            std::ptr::copy(
-                data.as_external_bytes().as_ptr(),
-                self.huge_pool.as_mutref(),
-                data.as_external_bytes().len(),
-            );
-            track_io!(self
-                .nvm
-                .write_all(self.huge_pool.to_slice(data.as_external_bytes().len())))?;
-
-            // original
-            // track/io!(self.nvm.write_all(data.as_external_bytes()))?;
+        if let Some(huge_pool) = &self.huge_pool {
+            unsafe {
+                std::ptr::copy(
+                    data.as_external_bytes().as_ptr(),
+                    huge_pool.as_mutref(),
+                    data.as_external_bytes().len(),
+                );
+                track_io!(self
+                          .nvm
+                          .write_all(huge_pool.to_slice(data.as_external_bytes().len())))?;
+                // original
+                // track_io!(self.nvm.write_all(data.as_external_bytes()))?;
+            }
+        }else {
+            track!(data.write_to(&mut self.nvm))?;
         }
-
         // NOTE:
         // この後にジャーナルへの書き込みが行われ、
         // そこで(必要に応じて)`sync`メソッドが呼び出されるので、
